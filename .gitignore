@@ -1,0 +1,13 @@
+# 个人皮肤与备份不入库（含个人信息与图片版权素材）
+skins/
+backups/
+*.bak_hero
+*.bak
+
+# Python
+__pycache__/
+*.pyc
+
+# 系统杂项
+Thumbs.db
+.DS_Store
