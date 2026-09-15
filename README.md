@@ -1,8 +1,14 @@
-# zys-workbuddy-reskin（WorkBuddy 换肤）
+<p align="center">
+  <img src="icon.png" alt="WorkBuddy 换肤" title="WorkBuddy 换肤" width="128" height="128">
+</p>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-lightgrey.svg)](#适用环境重要)
+<h1 align="center">zys-workbuddy-reskin（WorkBuddy 换肤）</h1>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" alt="Python 3.10+"></a>
+  <a href="#适用环境重要"><img src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-lightgrey.svg" alt="Platform: Windows | macOS"></a>
+</p>
 
 把任意一张图片变成 WorkBuddy 桌面端的官方主题皮肤——通过「借壳」官方内置主题的方式，
 皮肤随官方主题机制生效、跨重启存活，无需调试端口或任何启动器。
@@ -60,27 +66,49 @@ WorkBuddy 会拉取仓库并安装到技能目录。安装后无需额外配置�
    经典QQ / 涟漪 / 有风 / 同行 / 伙伴（选谁不影响效果，只是借它的位置）
 2. 提供一张图片（建议明亮、低饱和的横版风景或人像图，≥1600px 宽）
 3. 自动压缩、取色、生成 CSS 并覆盖（首次覆盖自动整目录备份）
-4. 重启 WorkBuddy → 设置→外观 选中该主题 → 完成
+4. 设置→外观：先选其他主题、再重新选中该主题 → 完成（该动作即刷新缓存，无需重启）
 
 维护命令（也可在会话里用自然语言触发）：
 
 ```bash
-python scripts/reskin.py check               # 环境预检：版本/平台/外观功能是否支持
-python scripts/reskin.py detect              # 查看主题目录与替换状态
-python scripts/reskin.py status              # 查看已安装的皮肤壳
-python scripts/reskin.py redo --name <名>     # 主题被淘汰/官方更新后重新覆盖
-python scripts/reskin.py rollback --name <名> # 恢复官方原样
+python scripts/reskin.py check                # 环境预检：版本/平台/外观功能是否支持
+python scripts/reskin.py detect               # 查看主题目录与替换状态
+python scripts/reskin.py status               # 查看已安装的皮肤壳（按主题最新目录判定）
+python scripts/reskin.py doctor               # 健康自检：列出失效皮肤及原因
+python scripts/reskin.py doctor --fix         # 一键修复失效皮肤（覆盖前自动备份官方原样）
+python scripts/reskin.py redo --name <名>      # 重新覆盖到该主题当前最新目录
+python scripts/reskin.py rollback --name <名>  # 恢复官方原样
 ```
 
 依赖：Python 3.10+；`make` 子命令需要 Pillow（`pip install pillow`），其余子命令零依赖。
 
+## 皮肤失效了怎么办？
+
+WorkBuddy 若回到官方原版主题，最常见的原因是**官方更新了该主题**：官方会新建一个
+`theme-<key>-<updatedAt>` 缓存目录并重新下载，客户端随之改用新目录，旧目录里你的皮肤
+不再被读取。这属于「借壳」机制的预期行为，不是皮肤损坏，**几秒即可恢复**：
+
+```bash
+python scripts/reskin.py doctor        # 自检：哪些皮肤失效、原因是什么
+python scripts/reskin.py doctor --fix  # 一键修复（覆盖前自动备份官方原样）
+```
+
+修复后进入 **设置 → 外观**，先选另一个主题、再重新选中你的壳主题，即可刷新缓存
+（**实测无需重启**）。
+
+装好本 skill 后，也可以直接用自然语言说「我的皮肤失效了」，AI 会自动完成上述自检与修复。
+
 ## 已知限制
 
-- 外观缓存目录上限 8 个，LRU 按 mtime 淘汰——下载新官方主题可能挤掉已替换的壳，`redo` 可恢复。
-- 官方更新某主题会改变其缓存目录名并重新下载，覆盖自定义 CSS，同样 `redo` 恢复。
+- **官方更新主题会导致皮肤失效**（最常见）：官方会新建 `theme-<key>-<updatedAt>` 缓存目录并
+  重新下载，客户端随之改用新目录，旧目录里的自定义 CSS 不再被读取，界面回到官方原样。
+  这不是皮肤损坏——运行 `doctor --fix` 即可恢复，无需重新制作。
+- 外观缓存目录上限 8 个，LRU 按 mtime 淘汰——下载新官方主题可能挤掉已替换的壳。
+  `doctor` 会报「该主题已无本地缓存」，此时需先在 设置→外观 启用一次该主题，再 `redo`。
 - 主题选择器中的缩略图仍显示官方原图（封面来自云端 CDN），选中后呈现的才是自定义皮肤。
 - 限时联名主题可能下架，不建议作为壳。
-- 验证环境：WorkBuddy 5.5.4 / Windows（5.5.6 复验通过，2026-09-11）。其他平台未验证。
+- 验证环境：WorkBuddy 5.5.4 / Windows（5.5.6 复验通过，2026-09-11；2026-09-14 复验
+  「官方更新致失效 → doctor --fix 恢复」全流程）。其他平台未验证。
 
 ## 免责声明
 

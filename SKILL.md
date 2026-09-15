@@ -1,6 +1,13 @@
 ---
 name: zys-workbuddy-reskin
-description: WorkBuddy 借壳换肤：把用户提供的图片制作成自包含皮肤 CSS（hero base64 内嵌 + 自动取色），覆盖到 WorkBuddy 官方内置主题的本地缓存（appearance-resources），用户在 设置→外观 选中该主题即通过官方合法路径应用自定义皮肤，且跨重启存活。当用户说 「换肤」「换主题」「WorkBuddy 皮肤」「换个背景主题」「reskin」「回滚换肤」「换肤重做」 或想用自己的图片美化 WorkBuddy 界面时使用。纯 Python 实现，无需 CDP/调试端口。
+display_name: WorkBuddy 换肤
+display_name_en: WorkBuddy Reskin
+description: WorkBuddy 借壳换肤：把用户提供的图片制作成自包含皮肤 CSS（hero base64 内嵌 + 自动取色），覆盖到 WorkBuddy 官方内置主题的本地缓存（appearance-resources），用户在 设置→外观 选中该主题即通过官方合法路径应用自定义皮肤，且跨重启存活。内置健康自检（doctor 子命令），可检测皮肤因官方更新主题而失效的情况并一键修复。当用户说 「换肤」「换主题」「WorkBuddy 皮肤」「换个背景主题」「reskin」「回滚换肤」「换肤重做」「皮肤失效」「皮肤没了」「换肤失效了」「皮肤变回原版」 或想用自己的图片美化 WorkBuddy 界面时使用。纯 Python 实现，无需 CDP/调试端口。
+description_zh: 把任意一张图片变成 WorkBuddy 桌面端的官方主题皮肤，借壳官方内置主题生效，跨重启存活；内置失效自检与一键修复。
+description_en: Turn any image into a WorkBuddy desktop theme skin by hijacking a built-in theme's local cache; survives restarts. Includes a health check that detects and repairs skins broken by official theme updates.
+category: design
+version: 1.1.0
+author: 周永三
 ---
 
 # zys-workbuddy-reskin（WorkBuddy 换肤）
@@ -22,8 +29,9 @@ reconcile 校验通过 → 跨重启存活**。此路线已经过本机 5.5.4 �
 | `detect` | 探测外观缓存目录、列出主题/映射/替换状态（只读，内置预检） |
 | `make --image <图> --name <英文名>` | 压缩图片+自动取色+生成 CSS → `skins/<name>/` |
 | `apply --name <名> --theme-key <key>` | 备份官方目录 → 覆盖其全部 skin.css |
-| `status` | 查看已安装壳及目标目录状态 |
-| `redo --name <名>` | 重新覆盖（LRU 淘汰/官方更新主题后） |
+| `status` | 查看已安装壳状态（按该主题**最新目录**判定，非 manifest 记录目录） |
+| `doctor [--fix]` | 健康自检：扫描全部皮肤并报告失效原因；`--fix` 一键修复（覆盖前自动备份） |
+| `redo --name <名> [--dry-run]` | 重新覆盖到该主题当前最新目录（官方更新/LRU 淘汰后） |
 | `rollback --name <名>` | 从备份恢复官方原样 |
 
 运行方式：`python <skill目录>/scripts/reskin.py <子命令>`。Python 优先用 WorkBuddy 自带的
@@ -69,11 +77,12 @@ reconcile 校验通过 → 跨重启存活**。此路线已经过本机 5.5.4 �
 6. **覆盖**：运行 `apply --name <名> --theme-key <key> --label <官方名>`。
     首次覆盖自动整目录备份到 `backups/`。然后输出验收指引（见下）。
 
-### 验收指引（apply 成功后必须完整输出，防用户重启后失去上下文）
+### 验收指引（apply / redo 成功后必须完整输出，防用户失去上下文）
 
 ```
-1. 重启 WorkBuddy（普通重启即可，无需任何启动器）
-2. 设置 → 外观 → 选择「<所选主题>」
+1. 设置 → 外观：先选其他主题，再重新选中「<所选主题>」
+   （该动作即触发客户端刷新主题缓存；2026-09-14 实测无需重启即可生效）
+2. 若界面未刷新，再重启 WorkBuddy（普通重启即可，无需任何启动器）
 3. 验收：首页与会话页应呈现您提供的图片与配色
 ```
 
@@ -87,30 +96,68 @@ reconcile 校验通过 → 跨重启存活**。此路线已经过本机 5.5.4 �
 
 ## 再次触发的分支路由
 
+**第 0 步（任何再次触发都先做）：健康自检 `doctor`。** 见下节「皮肤失效自检」。
+
 - **换壳**（把另一个内置主题也换成用户皮肤，或对已替换壳整体重来）→ **重走首次流程**
     （第 2 步起）：必须重新列出 5 款主题单选——用户可能希望多个内置主题都换成不同皮肤，
     不能默认沿用上次的壳。`status` 可先展示已替换的壳供参考。
 - **换图**（只换某个壳的图片素材）→ `status` 列出已有壳，单壳自动选定、多壳请用户挑，
     然后从第 3 步收图开始（跳过选壳）。
 - **回滚** → `rollback --name <名>`（多壳时先让用户挑）。
-- **重做** → `redo --name <名>`（用户报告"皮肤没了"时先 `status` 判断原因）。
+- **重做 / 皮肤失效**（用户报告「皮肤没了」「变回原版了」）→ 直接跑 `doctor`，按报告处理：
+    可修项用 `doctor --fix`（或对单个壳 `redo --name <名>`）；
+    若报「该主题已无本地缓存」→ 先请用户在 设置→外观 启用一次该主题，再 `redo`。
+
+## 皮肤失效自检（每次会话开始或用户提到换肤时执行）
+
+`~/.workbuddy/skills/zys-workbuddy-reskin` 里若已存在皮肤（`skins/*/manifest.json`），
+**在会话开始、或用户谈及换肤/皮肤异常时，先运行一次**：
+
+```bash
+python <skill目录>/scripts/reskin.py doctor
+```
+
+- 退出码 `0` = 全部正常；`1` = 存在异常。
+- 读到 `[FAIL]` 项即皮肤已失效。**不要等用户自己发现**——主动告知并询问是否修复，
+  或直接执行：
+
+```bash
+python <skill目录>/scripts/reskin.py doctor --fix
+```
+
+`doctor --fix` 会自动把失效皮肤重新覆盖到该主题的**当前最新目录**，覆盖前对官方原版
+自动整目录备份（可回滚），随后按验收指引提示用户刷新。
+
+**为什么会失效（必须向用户解释清楚）**：官方更新某主题时会**新建**
+`theme-<key>-<updatedAt>` 目录并重新下载，客户端随之改用新目录，旧目录里我们的
+自定义 CSS 不再被读取 —— 于是界面回到官方原样。这不是皮肤损坏，`doctor --fix`
+即可恢复，无需重新制作。
 
 ## 注意事项（务必遵守）
 
-1. **appearance-resources 上限 8 个目录，LRU 按 mtime 淘汰**：用户下载新官方主题可能挤掉
-    已替换的壳。被挤掉后 `status` 会显示「目标目录已消失」，redo 前需用户先启用一次该主题。
-2. **官方更新主题会改变目录名**（`<key>-<updatedAt>` 的 updatedAt 变化）→ 缓存未命中 →
-    重新下载官方 zip 覆盖我们的 CSS。同样用 `redo` 恢复。
-3. **备份不能放在 appearance-resources 里面**（可能被目录扫描误读），只放本 skill 的 `backups/`。
-4. **只覆盖 skin.css，不动官方 png/mp4 等资源**；CSS 自包含（hero base64 内嵌、零外部引用），
+1. **官方更新主题会改变目录名**（`<key>-<updatedAt>` 的 updatedAt 变化）→ 缓存未命中 →
+    重新下载官方 zip 覆盖我们的 CSS，界面回到原版。这是**最常见的失效原因**
+    （2026-09-14 实例：客户端启动后批量刷新 4 个主题的缓存目录，已替换的皮肤被旁路）。
+    用 `doctor --fix` 或 `redo` 恢复，无需重新制作皮肤。
+2. **appearance-resources 上限 8 个目录，LRU 按 mtime 淘汰**：用户下载新官方主题可能挤掉
+    已替换的壳。被挤掉后 `doctor` 会报「该主题已无本地缓存」，必须先请用户在 设置→外观
+    启用一次该主题（触发重新下载），再 `redo`。
+3. **健康判定必须基于「该主题当前最新目录」，不能看 manifest 记录的 dir_name**——记录会随
+    官方更新而过期。`status` / `doctor` 已按此实现；自行排查时若只看记录目录，会把失效误判为正常。
+4. **备份不能放在 appearance-resources 里面**（可能被目录扫描误读），只放本 skill 的 `backups/`。
+5. **只覆盖 skin.css，不动官方 png/mp4 等资源**；CSS 自包含（hero base64 内嵌、零外部引用），
     官方资源成为死重不影响呈现。
-5. **不要直写 localStorage**（workbuddy.appearance.*）——冷启动会被云端目录校验重置回 light，
+6. **不要直写 localStorage**（workbuddy.appearance.*）——冷启动会被云端目录校验重置回 light，
     此路已验证不通，勿再尝试。
-6. **版本适用性**：外观（主题皮肤）功能自 **WorkBuddy 5.5.3** 起提供（官方更新日志确认，
+7. **版本适用性**：外观（主题皮肤）功能自 **WorkBuddy 5.5.3** 起提供（官方更新日志确认，
     2026-09-08 前后上线），且**仅对个人版账号开放**（客户端代码实测：企业版
     ultimate/exclusive 被排除）；**小程序端与手机 App 端无此功能**。机制细节验证于
     5.5.4 / Windows，并在 5.5.6 复验通过（2026-09-11）。`check` 子命令以 app.asar 特征检测为主、版本号为辅做预检；
     macOS 路径已适配探测但未实测。WorkBuddy 大版本升级可能改变锚点类名或缓存机制，
     届时需重新探查（可参考 workbuddy-theme-apply skill 的诊断工具链）。
-7. `apply` 首次覆盖前**必须备份**；`redo` 不重复备份（官方原样备份保留首次的）。
-8. 对外开源分发时附 README.md 免责声明（见文件）。
+8. **备份纪律**：`apply`、`redo` 与 `doctor --fix` 在**目标为官方原版**时都会先整目录备份；
+    目标已是自定义皮肤则跳过（避免无意义重复备份）。`rollback` 恢复**最后一个**备份，
+    即最新版官方原样，不会出现版本错配。
+9. **生效方式**：在 设置→外观 先选其他主题、再重新选中目标主题，即可刷新缓存
+    （2026-09-14 实测**无需重启**）；仅在界面未刷新时才需要重启客户端。
+10. 对外开源分发时附 README.md 免责声明（见文件）。

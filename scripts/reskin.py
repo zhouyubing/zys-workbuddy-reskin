@@ -13,8 +13,9 @@
   detect            探测外观缓存目录、列出主题与替换状态（只读）
   make              图片 → 压缩/取色/生成 CSS（落在 skins/<name>/，不碰官方目录）
   apply             备份目标主题目录 → 覆盖其全部 skin.css
-  status            列出已安装的壳与目标目录当前状态
-  redo              从 skins/<name>/skin.css 重新覆盖（LRU 淘汰/官方更新后用）
+  status            列出已安装的壳与目标目录当前状态（按该主题「最新目录」判定，非记录目录）
+  doctor            健康自检：扫描全部皮肤并报告失效原因；--fix 一键批量修复（含自动备份）
+  redo              从 skins/<name>/skin.css 重新覆盖到该主题当前最新目录
   rollback          从 backups/ 恢复官方原样
 """
 
@@ -275,13 +276,49 @@ def cmd_check(args):
 
 # ── detect ──────────────────────────────────────────────────────────────
 
+# 外观缓存目录命名：theme-<resourceKey>-<updatedAt(ms)>
+DIR_NAME_RE = re.compile(r"(theme-[a-z0-9]+)-(\d+)")
+
+
+def dir_timestamp(dir_name):
+    """提取目录名尾部的 updatedAt（毫秒）；取不到返回 -1（排序时排最前）。"""
+    m = DIR_NAME_RE.fullmatch(dir_name)
+    return int(m.group(2)) if m else -1
+
+
+def is_reskinned(theme_dir):
+    """该主题目录是否已被本工具替换为自定义皮肤（检查 CSS 头部标记）。"""
+    css = theme_dir / "skin.css"
+    if not css.is_file():
+        return False
+    try:
+        return SKIN_MARK in css.read_text(encoding="utf-8", errors="ignore")[:200]
+    except Exception:
+        return False
+
+
+def latest_theme_dir(key, dirs=None):
+    """按 resourceKey 取该主题**当前最新**的缓存目录（不依赖字典序）。
+
+    key 可带或不带 `theme-` 前缀。返回 list_theme_dirs() 的元素或 None。
+    官方更新主题时会新建 updatedAt 更大的目录，客户端改用新目录——因此
+    「最新目录」才是客户端实际加载的那个，健康判定必须基于它。
+    """
+    k = key if key.startswith("theme-") else f"theme-{key}"
+    pool = dirs if dirs is not None else list_theme_dirs()
+    cands = [d for d in pool if d["resource_key"] == k]
+    if not cands:
+        return None
+    return max(cands, key=lambda x: dir_timestamp(x["dir_name"]))
+
+
 def list_theme_dirs():
     """返回 [ {resource_key, dir_name, mtime, skin_label, reskinned} ]"""
     if not APPEARANCE_DIR.is_dir():
         return []
     out = []
     for d in sorted(APPEARANCE_DIR.iterdir()):
-        m = re.fullmatch(r"(theme-[a-z0-9]+)-(\d+)", d.name)
+        m = DIR_NAME_RE.fullmatch(d.name)
         if not d.is_dir() or not m:
             continue
         key = m.group(1)
@@ -297,13 +334,7 @@ def list_theme_dirs():
                 if re.search(r"[\u4e00-\u9fff]", s):
                     cjk_hint = s
                     break
-        reskinned = False
-        root_css = d / "skin.css"
-        if root_css.is_file():
-            try:
-                reskinned = SKIN_MARK in root_css.read_text(encoding="utf-8", errors="ignore")[:200]
-            except Exception:
-                pass
+        reskinned = is_reskinned(d)
         out.append({
             "resource_key": key,
             "dir_name": d.name,
@@ -669,12 +700,21 @@ def load_manifest(name):
 
 
 def find_theme_dir(theme_key):
+    """定位该主题**当前最新**的缓存目录。
+
+    按目录名尾部的 updatedAt 数值比较（而非字典序）——官方更新主题会新建
+    updatedAt 更大的目录，客户端随即改用新目录，旧目录里的皮肤被旁路。
+    """
     if not APPEARANCE_DIR.is_dir():
         die(f"未找到外观缓存目录：{APPEARANCE_DIR}")
-    matches = sorted(APPEARANCE_DIR.glob(f"theme-{theme_key}-*"))
-    if not matches:
-        return None
-    return matches[-1]  # updatedAt 最大者（官方更新后的新目录）
+    best, best_ts = None, -1
+    for d in APPEARANCE_DIR.glob(f"theme-{theme_key}-*"):
+        if not d.is_dir():
+            continue
+        ts = dir_timestamp(d.name)
+        if ts > best_ts:
+            best, best_ts = d, ts
+    return best
 
 
 def backup_theme(theme_dir):
@@ -727,9 +767,63 @@ def cmd_apply(args):
     print(f"[reskin] 已覆盖 {len(tgts)} 个 skin.css 到 {theme_dir.name}")
     print(f"[reskin] 主题官方名：{manifest['target']['official_label'] or '(未知)'}")
     print("\n=== 请用户验收 ===")
-    print("1. 重启 WorkBuddy（普通重启即可）")
-    print("2. 设置 → 外观 → 选择上述主题")
+    print("1. 设置 → 外观：先选其他主题，再重新选中上述主题")
+    print("   （该动作会触发客户端刷新主题缓存，实测无需重启即可生效）")
+    print("2. 若界面仍未刷新，再重启 WorkBuddy")
     print("3. 确认首页/会话页呈现新皮肤；如不满意可提出调整（换图/调色/回滚）")
+
+
+# 皮肤健康状态
+ST_OK = "ok"                          # 最新目录已是自定义皮肤，且记录一致
+ST_RECORD_STALE = "record_stale"      # 皮肤有效，但 manifest 记录的目录已过期（需同步）
+ST_OFFICIAL_UPDATE = "official_update"  # 官方更新了该主题 → 新目录为官方原版，皮肤被旁路
+ST_OVERWRITTEN = "overwritten"        # 同一目录被官方覆盖回原样
+ST_NO_THEME_DIR = "no_theme_dir"      # 该主题已无本地缓存（LRU 淘汰 / 从未启用）
+ST_UNAPPLIED = "unapplied"            # 尚未 apply
+
+HEALTH_DESC = {
+    ST_OK: "正常",
+    ST_RECORD_STALE: "皮肤有效，但 manifest 记录的目录已过期（同步记录即可，不影响使用）",
+    ST_OFFICIAL_UPDATE: "失效 · 官方更新了该主题（新目录为官方原版），自定义皮肤被旁路",
+    ST_OVERWRITTEN: "失效 · 目标目录被官方覆盖回原样",
+    ST_NO_THEME_DIR: "失效 · 该主题已无本地缓存（被 LRU 淘汰），需先在 设置→外观 启用一次该主题",
+    ST_UNAPPLIED: "未 apply",
+}
+
+# 可自动修复的状态：重新覆盖（幂等；覆盖前若目标为官方原版会自动备份）
+FIXABLE = (ST_RECORD_STALE, ST_OFFICIAL_UPDATE, ST_OVERWRITTEN)
+
+
+def assess_skin(manifest, theme_dirs=None):
+    """判定单个皮肤的健康状态。
+
+    判定基准是**该主题当前最新的目录**（即客户端实际加载的那个），而非
+    manifest 里记录的 dir_name——记录会随官方主题更新而过期，这正是
+    「皮肤静默失效但 status 仍显示正常」的根因。
+    """
+    name = manifest.get("name", "?")
+    t = manifest.get("target")
+    if not t:
+        return {"status": ST_UNAPPLIED, "name": name, "label": "", "latest": None,
+                "recorded": None, "recorded_stale": False}
+    key = t["resource_key"]
+    label = (t.get("official_label")
+             or THEME_MAP["confirmed"].get(key.replace("theme-", ""), "")
+             or "(未知)")
+    pool = theme_dirs if theme_dirs is not None else list_theme_dirs()
+    latest = latest_theme_dir(key, pool)
+    recorded = next((d for d in pool if d["dir_name"] == t.get("dir_name")), None)
+    stale = latest is not None and latest["dir_name"] != t.get("dir_name")
+    if latest is None:
+        status = ST_NO_THEME_DIR
+    elif latest["reskinned"]:
+        status = ST_RECORD_STALE if stale else ST_OK
+    elif stale:
+        status = ST_OFFICIAL_UPDATE
+    else:
+        status = ST_OVERWRITTEN
+    return {"status": status, "name": name, "label": label, "latest": latest,
+            "recorded": recorded, "recorded_stale": stale}
 
 
 def cmd_status(_args):
@@ -737,31 +831,158 @@ def cmd_status(_args):
     if not manifests:
         print("当前没有任何已生成的皮肤。")
         return
-    theme_dirs = {d["dir_name"]: d for d in list_theme_dirs()}
+    theme_dirs = list_theme_dirs()
+    bad = 0
     for mf in manifests:
         m = json.loads(mf.read_text(encoding="utf-8"))
-        t = m.get("target")
-        line = f"· {m['name']}  colors={m['colors'].get('accent')}"
-        if not t:
+        a = assess_skin(m, theme_dirs)
+        line = f"· {a['name']}  colors={m['colors'].get('accent')}"
+        if a["status"] == ST_UNAPPLIED:
             print(line + "  （未 apply）")
             continue
-        cur = theme_dirs.get(t["dir_name"])
-        state = "目标目录已消失（被 LRU 淘汰或官方更新，需 redo：先让用户启用一次该主题）" if cur is None else (
-            "已生效" if cur["reskinned"] else "被官方覆盖回原样（需 redo）")
-        print(line + f"  → {t['dir_name']}（{t['official_label']}）{state}")
+        latest_name = a["latest"]["dir_name"] if a["latest"] else "(无缓存目录)"
+        extra = ""
+        if a["recorded_stale"]:
+            extra = f"  [记录目录 {m['target'].get('dir_name')} 已过期]"
+        if a["status"] == ST_OK:
+            print(line + f"  → {latest_name}（{a['label']}）已生效")
+        elif a["status"] == ST_RECORD_STALE:
+            print(line + f"  → {latest_name}（{a['label']}）已生效{extra}，可用 redo 同步")
+        else:
+            bad += 1
+            print(line + f"  → {latest_name}（{a['label']}）⚠ {HEALTH_DESC[a['status']]}{extra}")
+            if a["status"] in FIXABLE:
+                print(f"    修复：python scripts/reskin.py redo --name {a['name']}")
+            else:
+                print("    修复：先在 设置→外观 启用一次该主题（触发缓存下载），再 redo")
+    if bad:
+        print(f"\n共 {bad} 个皮肤需要修复；可运行 doctor --fix 一键处理。")
+    else:
+        print("\n全部皮肤状态正常。")
+
+
+def reskin_target(skin_name, do_backup=True):
+    """把皮肤覆盖到其目标主题的**当前最新**目录，并同步 manifest 记录。
+
+    供 redo 与 doctor --fix 共用。返回 {theme_dir, n_files, changed, backup}。
+    覆盖前若目标目录是官方原版，默认先整目录备份（保证可回滚）。
+    """
+    manifest, skin_dir = load_manifest(skin_name)
+    t = manifest.get("target")
+    if not t:
+        die(f"皮肤 {skin_name} 从未 apply 过，请先用 apply。")
+    css_path = skin_dir / "skin.css"
+    if not css_path.is_file():
+        die(f"皮肤 CSS 不存在：{css_path}，请先 make。")
+    theme_dir = find_theme_dir(t["resource_key"].replace("theme-", ""))
+    if theme_dir is None:
+        die(f"主题 {t['resource_key']} 无本地缓存目录。\n"
+            "请让用户在 设置→外观 启用一次该主题（触发下载），然后重试。")
+    changed = theme_dir.name != t.get("dir_name")
+    bak = None
+    if is_reskinned(theme_dir):
+        print("[reskin] 目标目录已是自定义皮肤，跳过备份。")
+    elif do_backup:
+        bak = backup_theme(theme_dir)
+        manifest.setdefault("backups", []).append(str(bak))
+        print(f"[reskin] 已备份官方原样 → {bak}")
+    else:
+        print("[reskin] 目标目录为官方原版（本次未备份）")
+    tgts = overwrite_css(theme_dir, css_path)
+    # 关键修复：把记录同步到实际生效目录，避免 status 一直盯着过期目录
+    manifest["target"] = {
+        "resource_key": t["resource_key"],
+        "dir_name": theme_dir.name,
+        "official_label": t.get("official_label", ""),
+    }
+    manifest["applied_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    (skin_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"theme_dir": theme_dir, "n_files": len(tgts), "changed": changed, "backup": bak}
 
 
 def cmd_redo(args):
-    manifest, skin_dir = load_manifest(args.name)
-    t = manifest.get("target")
+    manifest, _ = load_manifest(args.name)
+    t = manifest.get("target") or {}
     if not t:
         die("该皮肤从未 apply 过，请先用 apply。")
-    theme_dir = find_theme_dir(t["resource_key"].replace("theme-", ""))
-    if theme_dir is None:
-        die(f"目标主题目录不存在：{t['dir_name']}\n请让用户在 设置→外观 启用一次该主题后重试。")
-    tgts = overwrite_css(theme_dir, skin_dir / "skin.css")
-    print(f"[reskin] redo 完成：{len(tgts)} 个 skin.css 已重新覆盖到 {theme_dir.name}。")
-    print("提示：若主题此前已被用户选中，重启 WorkBuddy 即可生效；否则请在 设置→外观 重新选中。")
+    old_dir = t.get("dir_name", "(未记录)")
+    if args.dry_run:
+        theme_dir = find_theme_dir(t.get("resource_key", "").replace("theme-", ""))
+        print(f"[reskin] DRY-RUN：将把皮肤 {args.name} 覆盖到 "
+              f"{theme_dir.name if theme_dir else '(未找到目标目录)'}")
+        return
+    r = reskin_target(args.name)
+    print(f"[reskin] redo 完成：{r['n_files']} 个 skin.css 已重新覆盖到 {r['theme_dir'].name}。")
+    if r["changed"]:
+        print(f"[reskin] 注意：官方更新了该主题，目标目录已由 {old_dir} 变为 "
+              f"{r['theme_dir'].name}，manifest 记录已同步。")
+    print("生效方式：设置 → 外观 先选其他主题、再重新选中该主题"
+          "（实测无需重启）；若界面未刷新则重启 WorkBuddy。")
+
+
+def cmd_doctor(args):
+    """健康自检：扫描全部皮肤，报告失效原因；--fix 自动修复可修项。
+
+    退出码：0 = 全部正常；1 = 存在异常（含修复后仍有异常）。
+    """
+    manifests = sorted(SKINS_DIR.glob("*/manifest.json"))
+    if not manifests:
+        print("当前没有任何已生成的皮肤。")
+        sys.exit(0)
+    theme_dirs = list_theme_dirs()
+    print(f"外观缓存目录：{APPEARANCE_DIR}")
+    print(f"缓存主题目录数：{len(theme_dirs)}（客户端上限 8，超出后按 mtime LRU 淘汰）\n")
+    problems = []
+    for mf in manifests:
+        m = json.loads(mf.read_text(encoding="utf-8"))
+        a = assess_skin(m, theme_dirs)
+        latest = a["latest"]["dir_name"] if a["latest"] else "(无缓存目录)"
+        if a["status"] == ST_OK:
+            print(f"[ OK ] {a['name']:16s} → {latest}（{a['label']}）")
+            continue
+        if a["status"] == ST_UNAPPLIED:
+            print(f"[ -- ] {a['name']:16s} 尚未 apply")
+            continue
+        if a["status"] == ST_RECORD_STALE:
+            print(f"[ OK ] {a['name']:16s} → {latest}（{a['label']}）皮肤有效；"
+                  f"记录目录 {m['target'].get('dir_name')} 已过期")
+        else:
+            print(f"[FAIL] {a['name']:16s} → {latest}（{a['label']}）")
+            print(f"       {HEALTH_DESC[a['status']]}")
+            if a["recorded_stale"]:
+                print(f"       manifest 记录的目录 {m['target'].get('dir_name')} 已过期")
+        problems.append(a)
+
+    fixable = [a for a in problems if a["status"] in FIXABLE]
+    unfixable = [a for a in problems if a["status"] not in FIXABLE]
+    print()
+    if not problems:
+        print("结论：全部皮肤状态正常，无需处理。")
+        sys.exit(0)
+    if unfixable:
+        print("以下皮肤需人工介入（先让用户在 设置→外观 启用对应主题，再重跑）：")
+        for a in unfixable:
+            print(f"  - {a['name']}（{a['label']}）：{HEALTH_DESC[a['status']]}")
+    if not args.fix:
+        print(f"发现 {len(problems)} 个异常，其中 {len(fixable)} 个可自动修复。")
+        print("自动修复：python scripts/reskin.py doctor --fix")
+        sys.exit(1)
+    if not fixable:
+        print("没有可自动修复的项。")
+        sys.exit(1)
+    print(f"开始自动修复 {len(fixable)} 个皮肤…\n")
+    failed = []
+    for a in fixable:
+        print(f"--- 修复 {a['name']} ---")
+        try:
+            r = reskin_target(a["name"])
+            print(f"[reskin] 完成：{r['n_files']} 个 skin.css → {r['theme_dir'].name}\n")
+        except SystemExit:
+            failed.append(a["name"])
+            print(f"[reskin] 修复失败：{a['name']}\n", file=sys.stderr)
+    print("修复完毕。请在 设置→外观 重新选中对应主题以刷新缓存。")
+    sys.exit(1 if (failed or unfixable) else 0)
 
 
 def cmd_rollback(args):
@@ -788,7 +1009,7 @@ def cmd_rollback(args):
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
     print(f"[reskin] 回滚完成：{theme_dir.name} 已恢复官方原样。")
-    print("提示：用户需在 设置→外观 重新选中其他主题（或重启）以刷新缓存。")
+    print("提示：请在 设置→外观 先选其他主题、再重新选中该主题以刷新缓存（通常无需重启）。")
 
 
 def main():
@@ -819,10 +1040,16 @@ def main():
     pa.add_argument("--dry-run", action="store_true")
     pa.set_defaults(func=cmd_apply)
 
-    sub.add_parser("status", help="查看已安装壳状态").set_defaults(func=cmd_status)
+    sub.add_parser("status", help="查看已安装壳状态（按主题最新目录判定）").set_defaults(func=cmd_status)
 
-    pr = sub.add_parser("redo", help="重新覆盖（LRU 淘汰/官方更新后）")
+    pd = sub.add_parser("doctor", help="健康自检：扫描全部皮肤并报告失效原因（--fix 自动修复）")
+    pd.add_argument("--fix", action="store_true",
+                    help="自动修复可修项（重新覆盖到最新目录，覆盖前自动备份官方原样）")
+    pd.set_defaults(func=cmd_doctor)
+
+    pr = sub.add_parser("redo", help="重新覆盖到该主题当前最新目录（官方更新/LRU 淘汰后）")
     pr.add_argument("--name", required=True)
+    pr.add_argument("--dry-run", action="store_true")
     pr.set_defaults(func=cmd_redo)
 
     pb = sub.add_parser("rollback", help="恢复官方原样")
