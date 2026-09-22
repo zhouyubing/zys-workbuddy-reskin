@@ -12,6 +12,7 @@
   check             环境预检：平台/安装目录/客户端版本/外观功能支持（只读，exit 0=支持 3=不支持）
   detect            探测外观缓存目录、列出主题与替换状态（只读）
   make              图片 → 压缩/取色/生成 CSS（落在 skins/<name>/，不碰官方目录）
+  rebuild           用已有 hero 与配色重建 skin.css（CSS 模板升级后，无需重新给图）
   apply             备份目标主题目录 → 覆盖其全部 skin.css
   status            列出已安装的壳与目标目录当前状态（按该主题「最新目录」判定，非记录目录）
   doctor            健康自检：扫描全部皮肤并报告失效原因；--fix 一键批量修复（含自动备份）
@@ -279,6 +280,16 @@ def cmd_check(args):
 # 外观缓存目录命名：theme-<resourceKey>-<updatedAt(ms)>
 DIR_NAME_RE = re.compile(r"(theme-[a-z0-9]+)-(\d+)")
 
+# 主题包内的主样式文件名。5.5.x 为 skin.css；**5.6.2 起官方改用 skin.v2.css**
+# （2026-09-22 实测：同一主题目录内出现 skin.v2.css，客户端优先加载它；漏覆盖即皮肤失效）。
+# 用正则一并匹配，避免客户端再次改名或追加版本后缀时漏覆盖。
+SKIN_CSS_RE = re.compile(r"^skin(\.v\d+)?\.css$", re.IGNORECASE)
+
+
+def find_skin_css(theme_dir):
+    """列出主题目录内全部待覆盖的皮肤样式文件（skin.css / skin.v2.css / …）。"""
+    return [p for p in theme_dir.rglob("*.css") if SKIN_CSS_RE.match(p.name)]
+
 
 def dir_timestamp(dir_name):
     """提取目录名尾部的 updatedAt（毫秒）；取不到返回 -1（排序时排最前）。"""
@@ -287,12 +298,17 @@ def dir_timestamp(dir_name):
 
 
 def is_reskinned(theme_dir):
-    """该主题目录是否已被本工具替换为自定义皮肤（检查 CSS 头部标记）。"""
-    css = theme_dir / "skin.css"
-    if not css.is_file():
+    """该主题目录是否已**整套**替换为自定义皮肤。
+
+    要求找到的每个 skin*.css 都带标记：只覆盖了部分文件（例如漏掉根级 skin.v2.css）
+    必须判为未替换，否则会把失效误报成正常——2026-09-22 即因此暴露。
+    """
+    files = find_skin_css(theme_dir)
+    if not files:
         return False
     try:
-        return SKIN_MARK in css.read_text(encoding="utf-8", errors="ignore")[:200]
+        return all(SKIN_MARK in p.read_text(encoding="utf-8", errors="ignore")[:200]
+                   for p in files)
     except Exception:
         return False
 
@@ -510,18 +526,51 @@ body[data-application-name=workbuddy] {
   --cb-markdown-hr-border-color: color-mix(in srgb, var(--wb-accent) 30%, transparent) !important;
 }
 
-#root {
+/* ── 背景图载体（跨版本兼容）─────────────────────────────────────────
+   v1（≤5.5.x）：整屏背景挂在 #root。
+   v2（5.6.2+）：客户端改用新容器——页面主区为 .wb-home-route（新路由 modules/home）
+   或 .main-content--welcome（旧路由），最外层为 .teams-container。
+   实测 5.6.2 官方主题包中 #root / [data-view-id] 出现 0 次，故必须并列书写。 */
+/* 背景图统一存于 CSS 变量：base64 约 350KB，若在多个规则块内联会突破官方
+   512KB 上限，故只在此声明一次，其余规则一律 var() 引用。 */
+:root, body { --zys-skin-hero: url("%%HERO%%"); }
+
+#root,
+:root .teams-container,
+body .teams-container,
+:root .workbuddy-app,
+:root .teams-main-content,
+:root [data-view-id="main-content"],
+:root .wb-home-route,
+:root .teams-content-wrapper .teams-main-content .main-content--welcome {
   color: var(--wb-text) !important;
   background:
     linear-gradient(90deg, color-mix(in srgb, var(--wb-surface) 96%, transparent) 0 22%, transparent 46%),
     linear-gradient(180deg, transparent 0 45%, color-mix(in srgb, var(--wb-surface) 78%, transparent) 78% 100%),
-    url("%%HERO%%") right center / cover no-repeat fixed !important;
+    var(--zys-skin-hero) right center / cover no-repeat fixed !important;
 }
 
-.teams-container,
-.teams-container.is-mac { background: transparent !important; }
+:root .wb-home-route > .workbuddy-topbar,
+:root .wb-home-route .wb-home-cloud-header { background: var(--wb-surface) !important; }
 
-[data-view-id] { background: transparent !important; }
+/* ── v2 独立视图页面 ────────────────────────────────────────────────
+   以下页面不在 [data-view-id] 体系内，主容器自带不透明背景、会挡住外层图，
+   故单独为它们承载背景图（2026-09-22 实测：「助理」与「定时任务」曾被挡）。
+     · 助理              → claw 工作区
+     · 定时任务          → automation
+     · 专家·技能·连接器  → expert-center */
+:root .automation-main-page,
+:root .code-buddy-automation,
+:root .automation-workspace__content,
+:root .claw-workspace__main,
+:root [class*="claw-workspace"],
+:root .expert-center-light .ec-page-layout .ec-main-content,
+:root .ec-main-content {
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--wb-surface) 96%, transparent) 0 22%, transparent 46%),
+    linear-gradient(180deg, transparent 0 45%, color-mix(in srgb, var(--wb-surface) 78%, transparent) 78% 100%),
+    var(--zys-skin-hero) right center / cover no-repeat fixed !important;
+}
 
 .conversation-list,
 .main-content,
@@ -534,7 +583,8 @@ body[data-application-name=workbuddy] {
   backdrop-filter: blur(20px) saturate(1.12);
 }
 
-[data-view-id=main-content] { background: transparent !important; }
+/* 注：v2（5.6.2+）下 [data-view-id="main-content"] 由「背景图载体」承载背景图，
+   不再置透明；v1 场景该元素本就透明（图在外层 #root），两层同为 fixed 同图不冲突。 */
 
 [data-view-id=main-content] .workbuddy-topbar,
 div[data-testid=conversation-topbar] {
@@ -690,6 +740,44 @@ def cmd_make(args):
     print("  下一步：reskin.py apply --name %s --theme-key <resourceKey>" % name)
 
 
+def cmd_rebuild(args):
+    """用皮肤目录内已有的 hero 与配色重新生成 skin.css（模板升级后重建）。
+
+    不重新取色、不重新压缩——完全复用 make 时定稿的素材与颜色，结果稳定可预期。
+    用途：CSS 模板升级（例如适配客户端新版皮肤机制）后批量重建已有皮肤，
+    无需用户重新提供图片。
+    """
+    import base64 as _b64
+
+    manifest, skin_dir = load_manifest(args.name)
+    hero_path = skin_dir / "hero.webp"
+    if not hero_path.is_file():
+        die(f"未找到 hero 素材：{hero_path}（无法重建，请重新 make）")
+    colors = manifest.get("colors") or DEFAULT_COLORS
+    data_url = "data:image/webp;base64," + _b64.b64encode(hero_path.read_bytes()).decode()
+    css = build_css(manifest.get("name", args.name), colors, data_url,
+                    manifest.get("brand", ""), manifest.get("headline", ""))
+    size = len(css.encode("utf-8"))
+    if size > CSS_TARGET_BYTES:
+        die(f"重建后 CSS 超限（{size // 1024}KB > 500KB），请重新 make 压缩 hero。")
+    css_path = skin_dir / "skin.css"
+    if args.dry_run:
+        print(f"[reskin] DRY-RUN：将重建 {css_path}（{size // 1024}KB，配色 {colors.get('accent')}）")
+        return
+    css_path.write_text(css, encoding="utf-8")
+    manifest["css_bytes"] = size
+    manifest["rebuilt_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    (skin_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[reskin] 已重建 {css_path}（{size // 1024}KB，配色 {colors.get('accent')}）")
+    if args.apply:
+        r = reskin_target(args.name)
+        print(f"[reskin] 已同步覆盖 {r['n_files']} 个文件 → {r['theme_dir'].name}")
+        print("生效方式：设置 → 外观 先选其他主题、再重新选中该主题（通常无需重启）。")
+    else:
+        print("下一步：python scripts/reskin.py redo --name %s" % args.name)
+
+
 # ── apply / redo / rollback / status ───────────────────────────────────
 
 def load_manifest(name):
@@ -728,9 +816,9 @@ def backup_theme(theme_dir):
 
 def overwrite_css(theme_dir, css_path):
     css_text = css_path.read_text(encoding="utf-8")
-    targets = list(theme_dir.rglob("skin.css"))
+    targets = find_skin_css(theme_dir)
     if not targets:
-        die(f"目标目录中未找到任何 skin.css：{theme_dir}")
+        die(f"目标目录中未找到皮肤样式文件（skin.css / skin.v2.css）：{theme_dir}")
     for t in targets:
         t.write_text(css_text, encoding="utf-8")
     return targets
@@ -746,8 +834,7 @@ def cmd_apply(args):
     css_path = skin_dir / "skin.css"
     if not css_path.is_file():
         die(f"皮肤 CSS 不存在：{css_path}，请先 make。")
-    already = SKIN_MARK in (theme_dir / "skin.css").read_text(encoding="utf-8", errors="ignore")[:200]
-    if not already:
+    if not is_reskinned(theme_dir):
         bak = backup_theme(theme_dir)
         print(f"[reskin] 已备份官方原目录 → {bak}")
         manifest.setdefault("backups", []).append(str(bak))
@@ -1032,6 +1119,12 @@ def main():
     pm.add_argument("--surface"), pm.add_argument("--text")
     pm.add_argument("--brand", default=""), pm.add_argument("--headline", default="")
     pm.set_defaults(func=cmd_make)
+
+    prb = sub.add_parser("rebuild", help="用已有 hero 与配色重建 skin.css（CSS 模板升级后）")
+    prb.add_argument("--name", required=True)
+    prb.add_argument("--apply", action="store_true", help="重建后立即覆盖到主题目录")
+    prb.add_argument("--dry-run", action="store_true")
+    prb.set_defaults(func=cmd_rebuild)
 
     pa = sub.add_parser("apply", help="备份并覆盖目标主题")
     pa.add_argument("--name", required=True)
