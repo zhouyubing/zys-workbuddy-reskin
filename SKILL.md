@@ -1,13 +1,18 @@
 ---
 name: zys-workbuddy-reskin
+slug: zys-workbuddy-reskin
 display_name: WorkBuddy 换肤
+displayName: WorkBuddy 换肤
 display_name_en: WorkBuddy Reskin
 description: WorkBuddy 借壳换肤：把用户提供的图片制作成自包含皮肤 CSS（hero base64 内嵌 + 自动取色），覆盖到 WorkBuddy 官方内置主题的本地缓存（appearance-resources），用户在 设置→外观 选中该主题即通过官方合法路径应用自定义皮肤，且跨重启存活。内置健康自检（doctor 子命令），可检测皮肤因官方更新主题而失效的情况并一键修复。当用户说 「换肤」「换主题」「WorkBuddy 皮肤」「换个背景主题」「reskin」「回滚换肤」「换肤重做」「皮肤失效」「皮肤没了」「换肤失效了」「皮肤变回原版」 或想用自己的图片美化 WorkBuddy 界面时使用。纯 Python 实现，无需 CDP/调试端口。
 description_zh: 把任意一张图片变成 WorkBuddy 桌面端的官方主题皮肤，借壳官方内置主题生效，跨重启存活；内置失效自检与一键修复。
 description_en: Turn any image into a WorkBuddy desktop theme skin by hijacking a built-in theme's local cache; survives restarts. Includes a health check that detects and repairs skins broken by official theme updates.
+summary: 把任意一张图片变成 WorkBuddy 桌面端的官方主题皮肤，借壳官方内置主题生效、跨重启存活；内置失效自检与一键修复，无需调试端口。
 category: design
 version: 1.2.0
 author: 周永三
+license: MIT
+tags: [WorkBuddy, 换肤, 主题, 皮肤]
 ---
 
 # zys-workbuddy-reskin（WorkBuddy 换肤）
