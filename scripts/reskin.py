@@ -641,7 +641,222 @@ BRAND_TMPL = """
 """
 
 
+def official_base_css(theme_key=None):
+    """取官方原版底稿。
+
+    关键：**按主题 key 精确匹配**。若只按 mtime 取最新，会拿到别的主题的备份
+    （实测曾取到「伙伴」的蓝色底稿，导致暖金被偏移成橙色）。
+    """
+    def pick(pattern):
+        cands = []
+        for d in BACKUPS_DIR.glob("*.orig_*"):
+            if pattern and pattern not in d.name:
+                continue
+            for name in ("skin.v2.css", "skin.css"):
+                p = d / name
+                if p.is_file():
+                    cands.append(p)
+        cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return cands[0] if cands else None
+
+    if theme_key:
+        got = pick(f"theme-{theme_key}-")
+        if got:
+            return got
+    # 回退：优先有风（默认壳），再退回任意
+    return pick("theme-tkbera-") or pick(None)
+
+
+def _hls(hexstr):
+    r, g, b = (int(hexstr[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    return colorsys.rgb_to_hls(r, g, b)
+
+
+def hue_shift_css(base_css, from_hex, to_hex, surface_hex=None):
+    """把 base_css 中所有颜色按 from_hex → to_hex 的色相差整体偏移。
+
+    三类颜色分别处理（这是"偏橙"问题的解法）：
+      1. 纯灰（s<0.08）        → 原样保留，保住文字对比度
+      2. **浅色/表面色**（s<0.22 且 l>0.72）→ **归一到目标表面色的色相/饱和度，保留原明度**
+         （若走色相偏移，微绿的 #E3ECE4 会变成偏橙的 #FFEDE1，观感不对）
+      3. 其余（强调色等）      → 整体色相偏移
+
+    支持 hex / 逗号 rgb / 空格 rgb（CSS Color 4）三种写法。
+    """
+    fh = _hls(from_hex)[0] * 360
+    th = _hls(to_hex)[0] * 360
+    delta = ((th - fh + 180) % 360) - 180
+
+    # 目标表面色的色相与饱和度（来自皮肤 surface）
+    if surface_hex:
+        sh, s_l, s_s = colorsys.rgb_to_hls(*(int(surface_hex[i:i + 2], 16) / 255 for i in (1, 3, 5)))
+    else:
+        sh, s_s = th / 360.0, 0.06
+
+    def shift_rgb(r8, g8, b8):
+        h, l, s = colorsys.rgb_to_hls(r8 / 255, g8 / 255, b8 / 255)
+        if s < 0.08:
+            return None
+        if s < 0.22 and l > 0.72:
+            # 浅色/表面色：用目标表面色的色相+饱和度，保留原明度（保住层次）
+            nr, ng, nb = colorsys.hls_to_rgb(sh, min(l, 0.985), s_s)
+            return round(nr * 255), round(ng * 255), round(nb * 255)
+        nr, ng, nb = colorsys.hls_to_rgb(((h + delta / 360.0) % 1.0), l, s)
+        return round(nr * 255), round(ng * 255), round(nb * 255)
+
+    def sub_hex(m):
+        orig = m.group(0)
+        hx = orig[:7]
+        try:
+            r8, g8, b8 = (int(hx[i:i + 2], 16) for i in (1, 3, 5))
+        except Exception:
+            return orig
+        got = shift_rgb(r8, g8, b8)
+        if got is None:
+            return orig
+        out = "#%02X%02X%02X" % got
+        return out + orig[7:] if len(orig) > 7 else out
+
+    def sub_space(m):
+        r8, g8, b8 = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        alpha = m.group(4)
+        got = shift_rgb(r8, g8, b8)
+        if got is None:
+            return m.group(0)
+        head = "rgb(%d %d %d" % got
+        return head + (" / %s)" % alpha if alpha else ")")
+
+    def sub_comma(m):
+        parts = [p.strip() for p in m.group(1).split(",")]
+        if len(parts) < 3:
+            return m.group(0)
+        try:
+            r8, g8, b8 = (int(float(p)) for p in parts[:3])
+        except Exception:
+            return m.group(0)
+        got = shift_rgb(r8, g8, b8)
+        if got is None:
+            return m.group(0)
+        rest = ", " + ", ".join(parts[3:]) if len(parts) > 3 else ""
+        return "rgba(%d, %d, %d%s)" % (got[0], got[1], got[2], rest) if rest \
+            else "rgb(%d, %d, %d)" % got
+
+    css = re.sub(r"#[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?(?![0-9A-Fa-f])", sub_hex, base_css)
+    css = re.sub(r"rgb\(\s*(\d+)\s+(\d+)\s+(\d+)(?:\s*/\s*([\d.]+%?))?\s*\)",
+                 sub_space, css, flags=re.I)
+    css = re.sub(r"rgba?\(([^)]*)\)", sub_comma, css)
+    return css
+
+
+STRUCTURE_PATCH = """
+
+/* ═══ 结构补丁：透明层次与顶栏 ═════════════════════════════════════════
+   官方底稿只含颜色与背景图，不含本皮肤的「薄纱 / 磨砂 / 顶栏不透明」设计，
+   故追加在最末以保证优先级（同特异性下后者胜）。
+   注意：不要对 .wb-home-route 置透明——官方底稿的背景图就挂在该元素上。 */
+
+/* ── 背景图载体（关键）─────────────────────────────────────────────
+   官方底稿只把背景图挂在首页 .wb-home-route 上，会话页/外层容器是**纯色**。
+   因此换用官方底稿后，会话页会"透出一片纯色"而不是图。
+   这里按自研模板的成熟做法，给会话页与外层容器统一铺同一张图（fixed 保证位置一致）。 */
+#root,
+:root .teams-container,
+body .teams-container,
+:root .workbuddy-app,
+:root .teams-main-content,
+:root .teams-content-wrapper,
+:root [data-view-id="main-content"],
+:root .wb-home-route,
+:root .teams-content-wrapper .teams-main-content .main-content--welcome,
+:root .conversation-page-chrome,
+:root .conversation-page-chrome__shell,
+:root .conversation-page-chrome__content {
+  background-image: var(--zys-skin-hero) !important;
+  background-size: cover !important;
+  background-position: right center !important;
+  background-repeat: no-repeat !important;
+  background-attachment: fixed !important;
+}
+
+.conversation-list,
+.main-content,
+.main-content--welcome,
+.sidebar-next { background: transparent !important; }
+
+/* 会话页的网格容器（CSS Modules 类名，带 hash）会铺实色挡住背景图 → 置透明 */
+[class*="gridViewItem"],
+[class*="gridView"],
+.teams-grid-scroll-content {
+  background-color: transparent !important;
+  background-image: none !important;
+}
+
+[data-view-id="sidebar"] {
+  background: %%PANEL%% !important;
+  border-right: 1px solid %%ACCENT_LINE%% !important;
+  backdrop-filter: blur(20px) saturate(1.12);
+  -webkit-backdrop-filter: blur(20px) saturate(1.12);
+}
+
+[data-view-id="main-content"] .workbuddy-topbar,
+div[data-testid="conversation-topbar"],
+div#workbuddy-menubar-container {
+  background: var(--wb-surface) !important;
+  background-color: var(--wb-surface) !important;
+  opacity: 1 !important;
+  border-bottom: 1px solid color-mix(in srgb, var(--wb-accent) 30%, transparent) !important;
+}
+
+/* 会话内容区：33% 暖金薄纱，让背景图隐约透出
+   注：这里用显式 rgba 而非 color-mix——实测 color-mix 在本元素上未解析成功
+   （计算值退化为全透明），改用字面量可稳定生效。%%VEIL%% 由生成器替换。 */
+.conversation-shell {
+  background: %%VEIL%% !important;
+}
+
+[data-view-id="detail-panel"] {
+  background: %%PANEL%% !important;
+  backdrop-filter: blur(18px) saturate(1.08);
+  -webkit-backdrop-filter: blur(18px) saturate(1.08);
+}
+"""
+
+
+def build_css_from_official(base_css, accent_hex, hero_data_url, skin_id, surface_hex=None):
+    """官方底稿 + 整体色相偏移 + 换背景图（覆盖全部变量，免疫界面改版）。"""
+    m = re.search(r"--cb-button-primary\s*:\s*(#[0-9A-Fa-f]{6})", base_css)
+    official_accent = m.group(1) if m else "#3c8c4e"
+    css = hue_shift_css(base_css, official_accent, accent_hex, surface_hex)
+
+    # 官方包里的本地位图引用 → 换成我们的壁纸（只保留一份 base64）
+    css = re.sub(r'url\("local-file://[^"]*"\)', 'var(--zys-skin-hero)', css)
+    css = re.sub(r"url\('local-file://[^']*'\)", "var(--zys-skin-hero)", css)
+    css = re.sub(r"url\(local-file://[^)]*\)", "var(--zys-skin-hero)", css)
+
+    header = (
+        f"/* WORKBUDDY_SKIN:{skin_id} | base=official({official_accent}) "
+        f"-> accent({accent_hex}) | generated by zys-workbuddy-reskin */\n"
+        f':root, body {{ --zys-skin-hero: url("{hero_data_url}"); }}\n'
+    )
+    # 薄纱用显式 rgba（color-mix 实测在此元素上未生效）
+    surf = surface_hex or "#F6F4EF"
+    try:
+        sr, sg, sb = (int(surf[i:i + 2], 16) for i in (1, 3, 5))
+    except Exception:
+        sr, sg, sb = 246, 244, 239
+    patch = STRUCTURE_PATCH.replace("%%VEIL%%", f"rgba({sr}, {sg}, {sb}, 0.33)")
+    # 侧栏/详情面板的 88% 磨砂同样改用字面量（color-mix 在该环境不可靠）
+    patch = patch.replace("%%PANEL%%", f"rgba({sr}, {sg}, {sb}, 0.88)")
+    try:
+        ar, ag, ab = (int(accent_hex[i:i + 2], 16) for i in (1, 3, 5))
+    except Exception:
+        ar, ag, ab = 160, 138, 82
+    patch = patch.replace("%%ACCENT_LINE%%", f"rgba({ar}, {ag}, {ab}, 0.45)")
+    return header + css + patch
+
+
 def build_css(skin_id, colors, hero_data_url, brand="", headline=""):
+    """自研模板路径（v1.3.0 之前的方式，保留兼容）。"""
     if brand or headline:
         brand_block = BRAND_TMPL.replace("%%BRAND%%", json.dumps(brand or " "))
         brand_block = brand_block.replace("%%HEADLINE%%", json.dumps(headline or " "))
@@ -695,6 +910,13 @@ def cmd_make(args):
     q = args.quality
     hero_bytes = None
     data_url = ""
+    # 优先使用官方底稿（覆盖 650+ 变量，5.8.x 必需）；缺失时退回自研模板
+    _base = official_base_css(getattr(args, "theme_key", None))
+    base_css = _base.read_text(encoding="utf-8", errors="ignore") if _base else None
+    if base_css:
+        print(f"[reskin] 底稿：{_base.parent.name}（官方底稿 + 色相偏移）")
+    else:
+        print("[reskin] 警告：未找到官方底稿，退回自研模板（5.8.x 下可能缺配色）")
     for attempt in range(6):
         w, h = im.size
         if w > target_w:
@@ -705,7 +927,11 @@ def cmd_make(args):
         im2.save(tmp, "WEBP", quality=q, method=4)
         hero_bytes = tmp.read_bytes()
         data_url = "data:image/webp;base64," + base64.b64encode(hero_bytes).decode()
-        css = build_css(name, colors, data_url, args.brand, args.headline)
+        if base_css:
+            css = build_css_from_official(base_css, colors["accent"], data_url,
+                                          name, colors.get("surface"))
+        else:
+            css = build_css(name, colors, data_url, args.brand, args.headline)
         if len(css.encode("utf-8")) <= CSS_TARGET_BYTES:
             break
         tmp.unlink(missing_ok=True)
@@ -737,7 +963,7 @@ def cmd_make(args):
     for n in notes:
         print(f"  · {n}")
     print(f"  hero：宽{target_w}px / q{q} / {len(hero_bytes)//1024}KB；CSS 总计 {manifest['css_bytes']//1024}KB（上限 500KB）")
-    print("  下一步：reskin.py apply --name %s --theme-key <resourceKey>" % name)
+    print("  下一步：reskin.py apply --name %s --all-carriers" % name)
 
 
 def cmd_rebuild(args):
@@ -755,9 +981,44 @@ def cmd_rebuild(args):
         die(f"未找到 hero 素材：{hero_path}（无法重建，请重新 make）")
     colors = manifest.get("colors") or DEFAULT_COLORS
     data_url = "data:image/webp;base64," + _b64.b64encode(hero_path.read_bytes()).decode()
-    css = build_css(manifest.get("name", args.name), colors, data_url,
-                    manifest.get("brand", ""), manifest.get("headline", ""))
+    if getattr(args, "from_official", False):
+        shell = (manifest.get("keep_shell")
+                 or (manifest.get("target") or {}).get("dir_name") or "")
+        mm = re.match(r"theme-([a-z0-9]+)-", shell)
+        theme_key = mm.group(1) if mm else None
+        base = official_base_css(theme_key)
+        if not base:
+            die("找不到官方原版底稿（backups/*.orig_*），无法按官方底稿重建。")
+        base_css = base.read_text(encoding="utf-8", errors="ignore")
+        print(f"[reskin] 底稿：{base.parent.name}（{len(base_css) // 1024} KB，主题 {theme_key or '自动'}）")
+        css = build_css_from_official(base_css, colors["accent"], data_url,
+                                      manifest.get("name", args.name),
+                                      colors.get("surface"))
+    else:
+        css = build_css(manifest.get("name", args.name), colors, data_url,
+                        manifest.get("brand", ""), manifest.get("headline", ""))
     size = len(css.encode("utf-8"))
+    if size > CSS_TARGET_BYTES and getattr(args, "from_official", False):
+        # 官方底稿本身占 ~54KB，壁纸需要更小 → 自动递进压缩重试
+        require_pillow()
+        import io as _io
+        from PIL import Image as _Image
+        base_css = base.read_text(encoding="utf-8", errors="ignore")
+        im = _Image.open(hero_path).convert("RGB")
+        for q, w in ((78, None), (70, None), (70, 1600), (62, 1400), (55, 1200), (48, 1100)):
+            tmp = im.copy()
+            if w and tmp.width > w:
+                tmp = tmp.resize((w, round(tmp.height * w / tmp.width)), _Image.LANCZOS)
+            buf = _io.BytesIO()
+            tmp.save(buf, "WEBP", quality=q, method=6)
+            data_url = "data:image/webp;base64," + _b64.b64encode(buf.getvalue()).decode()
+            css = build_css_from_official(base_css, colors["accent"], data_url,
+                                          manifest.get("name", args.name),
+                                          colors.get("surface"))
+            size = len(css.encode("utf-8"))
+            print(f"[reskin] 超限，压缩壁纸重试 q={q} w={w or 'orig'} → {size // 1024}KB")
+            if size <= CSS_TARGET_BYTES:
+                break
     if size > CSS_TARGET_BYTES:
         die(f"重建后 CSS 超限（{size // 1024}KB > 500KB），请重新 make 压缩 hero。")
     css_path = skin_dir / "skin.css"
@@ -771,8 +1032,8 @@ def cmd_rebuild(args):
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[reskin] 已重建 {css_path}（{size // 1024}KB，配色 {colors.get('accent')}）")
     if args.apply:
-        r = reskin_target(args.name)
-        print(f"[reskin] 已同步覆盖 {r['n_files']} 个文件 → {r['theme_dir'].name}")
+        r = reskin_carriers(args.name)
+        print(f"[reskin] 已同步覆盖 {r['n_files']} 个主题目录：{', '.join(r['written'])}")
         print("生效方式：设置 → 外观 先选其他主题、再重新选中该主题（通常无需重启）。")
     else:
         print("下一步：python scripts/reskin.py redo --name %s" % args.name)
@@ -824,40 +1085,167 @@ def overwrite_css(theme_dir, css_path):
     return targets
 
 
+# 已过期/下架的限时主题：目录可能残留，但外观设置中已不可见。
+# 2026-10-17 实测：张韶涵已过期；Jane金已下架；激战金秋仍有效（至 2026-11-02）。
+EXPIRED_KEYS = {"tkhlwz", "tkhm0p"}
+
+
+def is_visible_key(key):
+    """该 resourceKey 是否在外观设置中可见（内置浅色/深色不落盘，不在此判断内）。"""
+    k = re.sub(r"^theme-", "", key)
+    if k in THEME_MAP["confirmed"]:
+        return True
+    return k in THEME_MAP["known_extra"] and k not in EXPIRED_KEYS
+
+
+def theme_label_of(key):
+    """resourceKey（可带 theme- 前缀）→ 官方主题名。"""
+    k = re.sub(r"^theme-", "", key)
+    return (THEME_MAP["confirmed"].get(k)
+            or THEME_MAP["known_extra"].get(k)
+            or "")
+
+
+def all_carrier_dirs():
+    """全部「可见主题」目录：按 resourceKey 去重，取每个 key 的最新目录。
+
+    注意口径：
+      - 目录数（含重复版本、过期残留）≥ 唯一 key 数
+      - 「可见主题」指 confirmed 表中的长期主题（内置浅色/深色不落盘、不在此列）
+    """
+    dirs = list_theme_dirs()
+    best = {}
+    for d in dirs:
+        k = d["resource_key"]
+        if k not in best or dir_timestamp(d["dir_name"]) > dir_timestamp(best[k]["dir_name"]):
+            best[k] = d
+    out = []
+    for k, d in best.items():
+        out.append({"key": k, "dir": APPEARANCE_DIR / d["dir_name"],
+                    "label": theme_label_of(k),
+                    "visible": is_visible_key(k)})
+    out.sort(key=lambda x: (not x["visible"], x["label"] or x["key"]))
+    return out
+
+
+def other_skins(current_name):
+    """列出除当前皮肤外的其他已 apply 皮肤：[(manifest, manifest_path)]。"""
+    out = []
+    for mf in sorted(SKINS_DIR.glob("*/manifest.json")):
+        try:
+            m = json.loads(mf.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if m.get("name") == current_name:
+            continue
+        if m.get("target") or m.get("carriers"):
+            out.append((m, mf))
+    return out
+
+
 def cmd_apply(args):
     manifest, skin_dir = load_manifest(args.name)
-    theme_key = re.sub(r"^theme-", "", args.theme_key)
-    theme_dir = find_theme_dir(theme_key)
-    if theme_dir is None:
-        die(f"resourceKey theme-{theme_key} 无本地缓存目录——该主题可能尚未启用。\n"
-            "请让用户在 设置→外观 点选一次该主题（触发下载），然后重试。")
     css_path = skin_dir / "skin.css"
     if not css_path.is_file():
         die(f"皮肤 CSS 不存在：{css_path}，请先 make。")
-    if not is_reskinned(theme_dir):
-        bak = backup_theme(theme_dir)
-        print(f"[reskin] 已备份官方原目录 → {bak}")
-        manifest.setdefault("backups", []).append(str(bak))
+
+    # ---------- 确定目标目录 ----------
+    if args.all_carriers:
+        carriers = all_carrier_dirs()
+        # 规则④：其他皮肤的「原借壳主题」予以保留，其余主题交给当前皮肤接管
+        others = other_skins(args.name)
+        reserved = set()
+        for om, _ in others:
+            shell = om.get("keep_shell") or (om.get("target") or {}).get("dir_name")
+            if shell:
+                reserved.add(shell)
+        targets = [c["dir"] for c in carriers if c["dir"].name not in reserved]
+        skipped = [c["dir"].name for c in carriers if c["dir"].name in reserved]
+        print(f"[reskin] 模式：写入全部主题（可见 {sum(1 for c in carriers if c['visible'])} 个 / 目录 {len(carriers)} 个）")
+        if reserved:
+            print(f"[reskin] 规则④：保留其他皮肤的原壳 {len(reserved)} 个 → {', '.join(sorted(reserved))}")
+        if skipped:
+            print(f"[reskin] 本次跳过（保留给旧皮肤）：{', '.join(skipped)}")
     else:
-        print("[reskin] 目标目录已是自定义皮肤，跳过重复备份（官方原样备份保留首次的）。")
+        if not args.theme_key:
+            die("请指定 --all-carriers（推荐）或 --theme-key <key>（单主题模式）。")
+        theme_key = re.sub(r"^theme-", "", args.theme_key)
+        d = find_theme_dir(theme_key)
+        if d is None:
+            die(f"resourceKey theme-{theme_key} 无本地缓存目录——该主题可能尚未启用。\n"
+                "请让用户在 设置→外观 点选一次该主题（触发下载），然后重试。")
+        targets = [d]
+        print(f"[reskin] 模式：单主题（--theme-key {theme_key}）")
+
+    if not targets:
+        die("没有可写入的主题目录（可能全部被其他皮肤保留）。")
+
+    # ---------- 备份 ----------
+    if not args.dry_run:
+        for d in targets:
+            if is_reskinned(d):
+                continue
+            bak = backup_theme(d)
+            manifest.setdefault("backups", []).append(str(bak))
+            print(f"[reskin] 已备份官方原目录 → {bak.name}")
+
     if args.dry_run:
-        tgts = list(theme_dir.rglob("skin.css"))
-        print(f"[reskin] DRY-RUN：将覆盖 {len(tgts)} 个文件：")
-        for t in tgts:
-            print("   ", t)
+        print(f"[reskin] DRY-RUN：将覆盖 {len(targets)} 个主题目录：")
+        for d in targets:
+            print(f"    {d.name}")
         return
-    tgts = overwrite_css(theme_dir, css_path)
-    manifest["target"] = {"resource_key": f"theme-{theme_key}", "dir_name": theme_dir.name,
-                          "official_label": args.label or THEME_MAP["confirmed"].get(theme_key, "")}
+
+    # ---------- 写入 ----------
+    total = 0
+    written = []
+    for d in targets:
+        n = len(overwrite_css(d, css_path))
+        total += n
+        written.append(d.name)
+        print(f"[reskin] 已覆盖 {n} 个 skin.css → {d.name}")
+
+    # ---------- 记录 ----------
+    if args.all_carriers:
+        manifest["mode"] = "all-carriers"
+        manifest["carriers"] = written
+        manifest["carriers_visible"] = sum(
+            1 for n in written if is_visible_key(n.rsplit("-", 1)[0]))
+        # keep_shell：首次分配时的借壳主题；若已有则保持不变
+        if not manifest.get("keep_shell"):
+            prev = (manifest.get("target") or {}).get("dir_name")
+            manifest["keep_shell"] = prev if prev in written else written[0]
+        # 同步其他皮肤的 carriers（被接管的主题从它们记录中移除）
+        for om, omf in other_skins(args.name):
+            oc = om.get("carriers") or []
+            shell = om.get("keep_shell") or (om.get("target") or {}).get("dir_name")
+            kept = [c for c in oc if c == shell]
+            if oc != kept:
+                om["carriers"] = kept
+                om["carriers_visible"] = 1 if shell else 0
+                om["mode"] = "all-carriers"
+                omf.write_text(json.dumps(om, ensure_ascii=False, indent=2), encoding="utf-8")
+                print(f"[reskin] 已回收 {om.get('name')} 的主题，仅保留原壳 {shell}")
+    else:
+        manifest["mode"] = "single"
+        manifest["carriers"] = written
+        manifest["carriers_visible"] = 1
+
+    manifest["target"] = {
+        "resource_key": re.sub(r"-\d+$", "", written[0]),
+        "dir_name": written[0],
+        "official_label": args.label or theme_label_of(written[0]),
+    }
     manifest["applied_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    (skin_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[reskin] 已覆盖 {len(tgts)} 个 skin.css 到 {theme_dir.name}")
-    print(f"[reskin] 主题官方名：{manifest['target']['official_label'] or '(未知)'}")
+    (skin_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print()
+    print(f"[reskin] 完成：{len(targets)} 个主题目录 / {total} 个 skin.css")
+    print(f"[reskin] 其中外观设置中可见：{manifest['carriers_visible']} 个")
     print("\n=== 请用户验收 ===")
-    print("1. 设置 → 外观：先选其他主题，再重新选中上述主题")
-    print("   （该动作会触发客户端刷新主题缓存，实测无需重启即可生效）")
+    print("1. 设置 → 外观：先选其他主题，再重新选中目标主题")
     print("2. 若界面仍未刷新，再重启 WorkBuddy")
-    print("3. 确认首页/会话页呈现新皮肤；如不满意可提出调整（换图/调色/回滚）")
+    print("3. 重启后会先显示官方主题（正常），切一下其他主题即可恢复皮肤")
 
 
 # 皮肤健康状态
@@ -924,6 +1312,13 @@ def cmd_status(_args):
         m = json.loads(mf.read_text(encoding="utf-8"))
         a = assess_skin(m, theme_dirs)
         line = f"· {a['name']}  colors={m['colors'].get('accent')}"
+        carriers = m.get("carriers") or []
+        if carriers:
+            pool = {d["dir_name"]: d for d in theme_dirs}
+            alive = sum(1 for c in carriers if pool.get(c, {}).get("reskinned"))
+            line += f"  carriers={alive}/{len(carriers)}"
+            if alive < len(carriers):
+                line += " ⚠"
         if a["status"] == ST_UNAPPLIED:
             print(line + "  （未 apply）")
             continue
@@ -946,6 +1341,63 @@ def cmd_status(_args):
         print(f"\n共 {bad} 个皮肤需要修复；可运行 doctor --fix 一键处理。")
     else:
         print("\n全部皮肤状态正常。")
+
+
+def resolve_carrier_dirs(manifest):
+    """解析皮肤应覆盖的全部主题目录（兼容 v1.2 的单 target 与 v1.3 的 carriers）。"""
+    out = []
+    names = list(manifest.get("carriers") or [])
+    t = manifest.get("target") or {}
+    if not names and t.get("dir_name"):
+        names = [t["dir_name"]]
+    for dn in names:
+        p = APPEARANCE_DIR / dn
+        if p.is_dir():
+            out.append(p)
+            continue
+        m = re.match(r"theme-([a-z0-9]+)-", dn)
+        if m:
+            latest = find_theme_dir(m.group(1))
+            if latest is not None:
+                out.append(latest)
+    return out
+
+
+def reskin_carriers(skin_name, do_backup=True):
+    """把皮肤覆盖到**全部 carrier 的当前最新目录**，并同步 manifest。
+
+    供 redo / doctor --fix 共用。v1.3 引入多壳后，只修主壳会导致其余主题永久失修。
+    """
+    manifest, skin_dir = load_manifest(skin_name)
+    css_path = skin_dir / "skin.css"
+    if not css_path.is_file():
+        die(f"皮肤 CSS 不存在：{css_path}，请先 make。")
+    dirs = resolve_carrier_dirs(manifest)
+    if not dirs:
+        die(f"皮肤 {skin_name} 找不到任何可用的主题目录，请先在 设置→外观 启用一次。")
+
+    written, backups = [], list(manifest.get("backups") or [])
+    for theme_dir in dirs:
+        if not is_reskinned(theme_dir) and do_backup:
+            bak = backup_theme(theme_dir)
+            backups.append(str(bak))
+            print(f"[reskin] 已备份官方原样 → {bak.name}")
+        overwrite_css(theme_dir, css_path)
+        written.append(theme_dir.name)
+        print(f"[reskin] 已覆盖 → {theme_dir.name}")
+
+    manifest["carriers"] = written
+    manifest["backups"] = backups
+    manifest["applied_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    if written:
+        manifest["target"] = {
+            "resource_key": re.sub(r"-\d+$", "", written[0]),
+            "dir_name": written[0],
+            "official_label": theme_label_of(written[0]),
+        }
+    (skin_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"dirs": dirs, "written": written, "n_files": len(written)}
 
 
 def reskin_target(skin_name, do_backup=True):
@@ -990,20 +1442,16 @@ def reskin_target(skin_name, do_backup=True):
 
 def cmd_redo(args):
     manifest, _ = load_manifest(args.name)
-    t = manifest.get("target") or {}
-    if not t:
+    if not (manifest.get("target") or manifest.get("carriers")):
         die("该皮肤从未 apply 过，请先用 apply。")
-    old_dir = t.get("dir_name", "(未记录)")
     if args.dry_run:
-        theme_dir = find_theme_dir(t.get("resource_key", "").replace("theme-", ""))
-        print(f"[reskin] DRY-RUN：将把皮肤 {args.name} 覆盖到 "
-              f"{theme_dir.name if theme_dir else '(未找到目标目录)'}")
+        dirs = resolve_carrier_dirs(manifest)
+        print(f"[reskin] DRY-RUN：将覆盖 {len(dirs)} 个主题目录：")
+        for d in dirs:
+            print("   ", d.name)
         return
-    r = reskin_target(args.name)
-    print(f"[reskin] redo 完成：{r['n_files']} 个 skin.css 已重新覆盖到 {r['theme_dir'].name}。")
-    if r["changed"]:
-        print(f"[reskin] 注意：官方更新了该主题，目标目录已由 {old_dir} 变为 "
-              f"{r['theme_dir'].name}，manifest 记录已同步。")
+    r = reskin_carriers(args.name)
+    print(f"[reskin] redo 完成：{r['n_files']} 个主题目录已重新覆盖。")
     print("生效方式：设置 → 外观 先选其他主题、再重新选中该主题"
           "（实测无需重启）；若界面未刷新则重启 WorkBuddy。")
 
@@ -1024,9 +1472,14 @@ def cmd_doctor(args):
     for mf in manifests:
         m = json.loads(mf.read_text(encoding="utf-8"))
         a = assess_skin(m, theme_dirs)
+        # 多壳统计：carriers 中有多少个仍是自定义皮肤
+        cs = m.get("carriers") or []
+        pool = {d["dir_name"]: d for d in theme_dirs}
+        alive = sum(1 for c in cs if pool.get(c, {}).get("reskinned"))
+        carrier_note = f"  [壳 {alive}/{len(cs)}]" if cs else ""
         latest = a["latest"]["dir_name"] if a["latest"] else "(无缓存目录)"
         if a["status"] == ST_OK:
-            print(f"[ OK ] {a['name']:16s} → {latest}（{a['label']}）")
+            print(f"[ OK ] {a['name']:16s} → {latest}（{a['label']}）{carrier_note}")
             continue
         if a["status"] == ST_UNAPPLIED:
             print(f"[ -- ] {a['name']:16s} 尚未 apply")
@@ -1063,8 +1516,8 @@ def cmd_doctor(args):
     for a in fixable:
         print(f"--- 修复 {a['name']} ---")
         try:
-            r = reskin_target(a["name"])
-            print(f"[reskin] 完成：{r['n_files']} 个 skin.css → {r['theme_dir'].name}\n")
+            r = reskin_carriers(a["name"])
+            print(f"[reskin] 完成：{r['n_files']} 个主题目录已覆盖\n")
         except SystemExit:
             failed.append(a["name"])
             print(f"[reskin] 修复失败：{a['name']}\n", file=sys.stderr)
@@ -1073,29 +1526,43 @@ def cmd_doctor(args):
 
 
 def cmd_rollback(args):
-    manifest, skin_dir = load_manifest(args.name)
-    t = manifest.get("target")
-    if not t:
+    manifest, _ = load_manifest(args.name)
+    if not (manifest.get("target") or manifest.get("carriers")):
         die("该皮肤从未 apply 过，无需回滚。")
     baks = manifest.get("backups") or []
     if not baks:
         die("manifest 中没有备份记录（可能 apply 时目标已是自定义皮肤）。")
-    bak = Path(baks[-1])
-    if not bak.is_dir():
-        die(f"备份目录不存在：{bak}")
-    theme_dir = find_theme_dir(t["resource_key"].replace("theme-", ""))
-    if theme_dir is None:
-        die(f"目标主题目录不存在，无法回滚：{t['dir_name']}")
+
+    dirs = resolve_carrier_dirs(manifest)
+    if not dirs:
+        die("找不到目标主题目录，无法回滚。")
     if args.dry_run:
-        print(f"[reskin] DRY-RUN：将用 {bak} 覆盖 {theme_dir}")
+        print(f"[reskin] DRY-RUN：将回滚 {len(dirs)} 个主题目录：")
+        for d in dirs:
+            print("   ", d.name)
         return
-    for src in bak.rglob("*"):
-        if src.is_file():
-            rel = src.relative_to(bak)
-            dst = theme_dir / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
-    print(f"[reskin] 回滚完成：{theme_dir.name} 已恢复官方原样。")
+
+    restored, missed = 0, []
+    for theme_dir in dirs:
+        # 按目录名前缀匹配该目录自己的官方备份
+        cand = [Path(b) for b in baks
+                if Path(b).name.startswith(theme_dir.name + ".orig_") and Path(b).is_dir()]
+        if not cand:
+            missed.append(theme_dir.name)
+            continue
+        bak = sorted(cand, key=lambda p: p.stat().st_mtime)[0]  # 取最早那份（原始官方）
+        for src in bak.rglob("*"):
+            if src.is_file():
+                rel = src.relative_to(bak)
+                dst = theme_dir / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+        restored += 1
+        print(f"[reskin] 已还原 → {theme_dir.name}")
+
+    if missed:
+        print(f"[reskin] 以下目录无备份，未还原：{', '.join(missed)}")
+    print(f"[reskin] 回滚完成：{restored} 个目录已恢复官方原样。")
     print("提示：请在 设置→外观 先选其他主题、再重新选中该主题以刷新缓存（通常无需重启）。")
 
 
@@ -1118,17 +1585,26 @@ def main():
     pm.add_argument("--accent"), pm.add_argument("--secondary")
     pm.add_argument("--surface"), pm.add_argument("--text")
     pm.add_argument("--brand", default=""), pm.add_argument("--headline", default="")
+    pm.add_argument("--theme-key", default=None,
+                    help="指定用哪个主题的官方底稿（默认 tkbera 有风）")
     pm.set_defaults(func=cmd_make)
 
     prb = sub.add_parser("rebuild", help="用已有 hero 与配色重建 skin.css（CSS 模板升级后）")
     prb.add_argument("--name", required=True)
     prb.add_argument("--apply", action="store_true", help="重建后立即覆盖到主题目录")
     prb.add_argument("--dry-run", action="store_true")
+    prb.add_argument("--from-official", action="store_true",
+                     help="以官方原版 CSS 为底稿做整体色相偏移（覆盖全部变量，推荐 5.8.x）")
     prb.set_defaults(func=cmd_rebuild)
 
-    pa = sub.add_parser("apply", help="备份并覆盖目标主题")
+    pa = sub.add_parser("apply", help="写入皮肤（默认写入全部可见主题）")
     pa.add_argument("--name", required=True)
-    pa.add_argument("--theme-key", required=True, help="如 tkbera（不带 theme- 前缀亦可）")
+    pa.add_argument("--all-carriers", action="store_true",
+                    help="写入全部可见主题（推荐；重启后切任意主题都能恢复皮肤）")
+    pa.add_argument("--theme-key", default=None,
+                    help="单主题模式：只写入该主题（如 tkbera），需显式指定")
+    pa.add_argument("--single", action="store_true",
+                    help="单主题模式的显式开关（与 --theme-key 搭配，供高级用户）")
     pa.add_argument("--label", default="", help="主题官方名（用于汇报）")
     pa.add_argument("--dry-run", action="store_true")
     pa.set_defaults(func=cmd_apply)
